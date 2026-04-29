@@ -3,9 +3,19 @@ Tool Registry for Conditional Tool Registration
 
 This module provides a registry system that allows tools to be conditionally registered
 based on tier configuration, replacing direct @server.tool() decorators.
+
+Fork addition (justinritchie):
+- WORKSPACE_MCP_TOOL_DENYLIST: comma-separated list of tool function names to skip
+  registering. Useful for permanently dropping rarely-used dev/admin tools without
+  patching every call site.
+- WORKSPACE_MCP_TOOL_SUFFIX: string appended to every registered tool's MCP-facing
+  name. Lets a single fork run as multiple instances (one per Google account) without
+  the model conflating same-named tools across connectors. Backward-compatible: empty
+  string (default) preserves upstream behavior exactly.
 """
 
 import logging
+import os
 from typing import Set, Optional, Callable
 
 from auth.oauth_config import is_oauth21_enabled
@@ -13,6 +23,22 @@ from auth.permissions import is_permissions_mode, get_allowed_scopes_set
 from auth.scopes import is_read_only_mode, get_all_read_only_scopes
 
 logger = logging.getLogger(__name__)
+
+
+def _get_tool_denylist() -> Set[str]:
+    """Parse WORKSPACE_MCP_TOOL_DENYLIST env var into a set of tool function names.
+
+    Tool names in the denylist are matched against the *base* (pre-suffix) name,
+    so a denylist entry of "debug_table_structure" applies regardless of any
+    WORKSPACE_MCP_TOOL_SUFFIX in effect.
+    """
+    raw = os.environ.get("WORKSPACE_MCP_TOOL_DENYLIST", "")
+    return {entry.strip() for entry in raw.split(",") if entry.strip()}
+
+
+def _get_tool_suffix() -> str:
+    """Parse WORKSPACE_MCP_TOOL_SUFFIX env var. Empty string disables the feature."""
+    return os.environ.get("WORKSPACE_MCP_TOOL_SUFFIX", "")
 
 # Global registry of enabled tools
 _enabled_tools: Optional[Set[str]] = None
@@ -62,18 +88,42 @@ def conditional_tool(server, tool_name: str):
 def wrap_server_tool_method(server):
     """
     Track tool registrations and filter them post-registration.
+
+    Fork additions (justinritchie):
+    - WORKSPACE_MCP_TOOL_DENYLIST: tools whose base/function name appears in
+      this set are skipped at registration time (never reach FastMCP).
+    - WORKSPACE_MCP_TOOL_SUFFIX: appended to the MCP-facing tool name so a
+      single codebase can run as multiple instances on multiple ports without
+      colliding tool names across connectors. The Python function name is
+      unchanged; only the externally-visible MCP tool name gets the suffix.
     """
     original_tool = server.tool
     server._tracked_tools = []
 
     def tracking_tool(*args, **kwargs):
-        original_decorator = original_tool(*args, **kwargs)
+        denylist = _get_tool_denylist()
+        suffix = _get_tool_suffix()
 
         def wrapper_decorator(func: Callable) -> Callable:
-            tool_name = func.__name__
-            server._tracked_tools.append(tool_name)
-            # Always apply the original decorator to register the tool
-            return original_decorator(func)
+            base_name = kwargs.get("name") or func.__name__
+
+            # Denylist check on the base name — applied before suffix so a
+            # single denylist works across all instances regardless of suffix.
+            if base_name in denylist:
+                logger.debug(f"Skipping registration of denylisted tool: {base_name}")
+                return func  # caller still gets the function, but nothing is registered
+
+            # Apply suffix by injecting/overriding the `name=` kwarg the wrapped
+            # `server.tool()` decorator factory accepts. If suffix is empty,
+            # behavior is identical to upstream.
+            final_kwargs = dict(kwargs)
+            if suffix:
+                final_kwargs["name"] = base_name + suffix
+
+            registered_name = final_kwargs.get("name") or base_name
+            server._tracked_tools.append(registered_name)
+            decorator = original_tool(*args, **final_kwargs)
+            return decorator(func)
 
         return wrapper_decorator
 
